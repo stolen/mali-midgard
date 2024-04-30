@@ -49,6 +49,7 @@
 #include <mali_kbase_mem_linux.h>
 #include <mali_kbase_tlstream.h>
 #include <mali_kbase_ioctl.h>
+#include <linux/version_compat_defs.h>
 
 
 static int kbase_vmap_phy_pages(struct kbase_context *kctx,
@@ -640,13 +641,13 @@ int kbase_mem_evictable_init(struct kbase_context *kctx)
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 1, 0)
 	kctx->reclaim.batch = 0;
 #endif
-	register_shrinker(&kctx->reclaim);
+	KBASE_REGISTER_SHRINKER((&kctx->reclaim), "mali-mem", kctx);
 	return 0;
 }
 
 void kbase_mem_evictable_deinit(struct kbase_context *kctx)
 {
-	unregister_shrinker(&kctx->reclaim);
+	KBASE_UNREGISTER_SHRINKER(&kctx->reclaim);
 }
 
 /**
@@ -1103,19 +1104,8 @@ static struct kbase_va_region *kbase_mem_from_user_buffer(
 	}
 
 	down_read(&current->mm->mmap_lock);
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 6, 0)
-	faulted_pages = get_user_pages(current, current->mm, address, *va_pages,
-			reg->flags & KBASE_REG_GPU_WR, 0, pages, NULL);
-#elif LINUX_VERSION_CODE < KERNEL_VERSION(4, 9, 0)
-	faulted_pages = get_user_pages(address, *va_pages,
-			reg->flags & KBASE_REG_GPU_WR, 0, pages, NULL);
-#else
-	faulted_pages = get_user_pages(address, *va_pages,
-			reg->flags & KBASE_REG_GPU_WR ? FOLL_WRITE : 0,
-			pages, NULL);
-#endif
-
+	faulted_pages =
+		kbase_get_user_pages(address, *va_pages, reg->flags & KBASE_REG_GPU_WR ? FOLL_WRITE : 0, pages, NULL);
 	up_read(&current->mm->mmap_lock);
 
 	if (faulted_pages != *va_pages)
@@ -1827,11 +1817,7 @@ static int kbase_cpu_mmap(struct kbase_context *kctx,
 	 * See MIDBASE-1057
 	 */
 
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 7, 0))
-	vma->vm_flags |= VM_DONTCOPY | VM_DONTDUMP | VM_DONTEXPAND | VM_IO;
-#else
-	vma->vm_flags |= VM_DONTCOPY | VM_DONTEXPAND | VM_RESERVED | VM_IO;
-#endif
+	vm_flags_set(vma, VM_DONTCOPY | VM_DONTDUMP | VM_DONTEXPAND | VM_IO);
 	vma->vm_ops = &kbase_vm_ops;
 	vma->vm_private_data = map;
 
@@ -1883,7 +1869,7 @@ static int kbase_cpu_mmap(struct kbase_context *kctx,
 	if (!kaddr) {
 		unsigned long addr = vma->vm_start + aligned_offset;
 
-		vma->vm_flags |= VM_PFNMAP;
+		vm_flags_set(vma, VM_PFNMAP);
 		for (i = 0; i < nr_pages; i++) {
 			phys_addr_t phys;
 
@@ -1898,7 +1884,7 @@ static int kbase_cpu_mmap(struct kbase_context *kctx,
 	} else {
 		WARN_ON(aligned_offset);
 		/* MIXEDMAP so we can vfree the kaddr early and not track it after map time */
-		vma->vm_flags |= VM_MIXEDMAP;
+		vm_flags_set(vma, VM_MIXEDMAP);
 		/* vmalloc remaping is easy... */
 		err = remap_vmalloc_range(vma, kaddr, 0);
 		WARN_ON(err);
@@ -2079,9 +2065,9 @@ int kbase_mmap(struct file *file, struct vm_area_struct *vma)
 	dev_dbg(dev, "kbase_mmap\n");
 
 	if (!(vma->vm_flags & VM_READ))
-		vma->vm_flags &= ~VM_MAYREAD;
+		vm_flags_clear(vma, VM_MAYREAD);
 	if (!(vma->vm_flags & VM_WRITE))
-		vma->vm_flags &= ~VM_MAYWRITE;
+		vm_flags_clear(vma, VM_MAYWRITE);
 
 	if (0 == nr_pages) {
 		err = -EINVAL;
@@ -2408,6 +2394,23 @@ void kbase_vunmap(struct kbase_context *kctx, struct kbase_vmap_struct *map)
 }
 KBASE_EXPORT_TEST_API(kbase_vunmap);
 
+static void kbasep_add_mm_counter(struct mm_struct *mm, int member, long value)
+{
+#if (KERNEL_VERSION(6, 2, 0) <= LINUX_VERSION_CODE)
+	/* To avoid the build breakage due to the type change in rss_stat,
+	 * we inline here the equivalent of 'add_mm_counter()' from linux kernel V6.2.
+	 */
+	percpu_counter_add(&mm->rss_stat[member], value);
+#elif (KERNEL_VERSION(5, 5, 0) <= LINUX_VERSION_CODE)
+	/* To avoid the build breakage due to an unexported kernel symbol 'mm_trace_rss_stat',
+	 * we inline here the equivalent of 'add_mm_counter()' from linux kernel V5.5.
+	 */
+	atomic_long_add(value, &mm->rss_stat.count[member]);
+#else
+	add_mm_counter(mm, member, value);
+#endif
+}
+
 void kbasep_os_process_page_usage_update(struct kbase_context *kctx, int pages)
 {
 	struct mm_struct *mm;
@@ -2417,18 +2420,10 @@ void kbasep_os_process_page_usage_update(struct kbase_context *kctx, int pages)
 	if (mm) {
 		atomic_add(pages, &kctx->nonmapped_pages);
 #ifdef SPLIT_RSS_COUNTING
-#if (LINUX_VERSION_CODE < KERNEL_VERSION(5, 5, 0))
-		add_mm_counter(mm, MM_FILEPAGES, pages);
-#else
-		atomic_long_add(pages, &mm->rss_stat.count[MM_FILEPAGES]);
-#endif
+		kbasep_add_mm_counter(mm, MM_FILEPAGES, pages);
 #else
 		spin_lock(&mm->page_table_lock);
-#if (LINUX_VERSION_CODE < KERNEL_VERSION(5, 5, 0))
-		add_mm_counter(mm, MM_FILEPAGES, pages);
-#else
-		atomic_long_add(pages, &mm->rss_stat.count[MM_FILEPAGES]);
-#endif
+		kbasep_add_mm_counter(mm, MM_FILEPAGES, pages);
 		spin_unlock(&mm->page_table_lock);
 #endif
 	}
@@ -2453,18 +2448,10 @@ static void kbasep_os_process_page_usage_drain(struct kbase_context *kctx)
 
 	pages = atomic_xchg(&kctx->nonmapped_pages, 0);
 #ifdef SPLIT_RSS_COUNTING
-#if (LINUX_VERSION_CODE < KERNEL_VERSION(5, 5, 0))
-	add_mm_counter(mm, MM_FILEPAGES, -pages);
-#else
-	atomic_long_add(pages, &mm->rss_stat.count[MM_FILEPAGES]);
-#endif
+	kbasep_add_mm_counter(mm, MM_FILEPAGES, -pages);
 #else
 	spin_lock(&mm->page_table_lock);
-#if (LINUX_VERSION_CODE < KERNEL_VERSION(5, 5, 0))
-	add_mm_counter(mm, MM_FILEPAGES, -pages);
-#else
-	atomic_long_add(pages, &mm->rss_stat.count[MM_FILEPAGES]);
-#endif
+	kbasep_add_mm_counter(mm, MM_FILEPAGES, -pages);
 	spin_unlock(&mm->page_table_lock);
 #endif
 }
@@ -2495,12 +2482,8 @@ static int kbase_tracking_page_setup(struct kbase_context *kctx, struct vm_area_
 	spin_unlock(&kctx->mm_update_lock);
 
 	/* no real access */
-	vma->vm_flags &= ~(VM_READ | VM_MAYREAD | VM_WRITE | VM_MAYWRITE | VM_EXEC | VM_MAYEXEC);
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 7, 0))
-	vma->vm_flags |= VM_DONTCOPY | VM_DONTEXPAND | VM_DONTDUMP | VM_IO;
-#else
-	vma->vm_flags |= VM_DONTCOPY | VM_DONTEXPAND | VM_RESERVED | VM_IO;
-#endif
+	vm_flags_clear(vma, VM_READ | VM_MAYREAD | VM_WRITE | VM_MAYWRITE | VM_EXEC | VM_MAYEXEC);
+	vm_flags_set(vma, VM_DONTCOPY | VM_DONTEXPAND | VM_DONTDUMP | VM_IO);
 	vma->vm_ops = &kbase_vm_special_ops;
 	vma->vm_private_data = kctx;
 

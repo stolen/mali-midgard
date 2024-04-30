@@ -203,8 +203,13 @@ static int debug_mem_open(struct inode *i, struct file *file)
 	struct debug_mem_data *mem_data;
 	int ret;
 
-	if (get_file_rcu(kctx_file) == 0)
-		return -ENOENT;
+	/* Check if file was opened in write mode. GPU memory contents
+	 * are returned only when the file is not opened in write mode.
+	 */
+	if (file->f_mode & FMODE_WRITE) {
+		file->private_data = kctx;
+		return 0;
+	}
 
 	ret = seq_open(file, &ops);
 	if (ret)

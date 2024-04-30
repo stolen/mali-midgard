@@ -28,6 +28,7 @@
 #include <linux/shrinker.h>
 #include <linux/atomic.h>
 #include <linux/version.h>
+#include <linux/version_compat_defs.h>
 
 #define pool_dbg(pool, format, ...) \
 	dev_dbg(pool->kbdev->dev, "%s-pool [%zu/%zu]: " format,	\
@@ -397,7 +398,7 @@ int kbase_mem_pool_init(struct kbase_mem_pool *pool,
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 1, 0)
 	pool->reclaim.batch = 0;
 #endif
-	register_shrinker(&pool->reclaim);
+	KBASE_REGISTER_SHRINKER((&pool->reclaim), "mali-mem", pool);
 
 	pool_dbg(pool, "initialized\n");
 
@@ -422,7 +423,7 @@ void kbase_mem_pool_term(struct kbase_mem_pool *pool)
 
 	pool_dbg(pool, "terminate()\n");
 
-	unregister_shrinker(&pool->reclaim);
+	KBASE_UNREGISTER_SHRINKER(&pool->reclaim);
 
 	kbase_mem_pool_lock(pool);
 	pool->max_size = 0;

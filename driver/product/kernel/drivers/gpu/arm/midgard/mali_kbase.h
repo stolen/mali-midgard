@@ -61,7 +61,7 @@
 #include "mali_kbase_strings.h"
 #include "mali_kbase_mem_lowlevel.h"
 #include "mali_kbase_js.h"
-#include "mali_kbase_utility.h"
+#include <linux/version_compat_defs.h>
 #include "mali_kbase_mem.h"
 #include "mali_kbase_gpu_memory_debugfs.h"
 #include "mali_kbase_mem_profile_debugfs.h"

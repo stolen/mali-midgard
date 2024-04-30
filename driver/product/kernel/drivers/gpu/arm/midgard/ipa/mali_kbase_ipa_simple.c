@@ -31,6 +31,7 @@
 
 #include "mali_kbase.h"
 #include "mali_kbase_defs.h"
+#include "mali_kbase_ipa.h"
 #include "mali_kbase_ipa_simple.h"
 #include "mali_kbase_ipa_debugfs.h"
 
